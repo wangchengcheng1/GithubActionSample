@@ -1,8 +1,7 @@
-# 安装依赖 pip3 install requests html5lib bs4 schedule
+# 安装依赖 pip3 install requests schedule
 import os
 import requests
 import json
-from bs4 import BeautifulSoup
 
 # 从测试号信息获取
 appID = os.environ.get("APP_ID")
@@ -12,50 +11,37 @@ openId = os.environ.get("OPEN_ID")
 # 天气预报模板ID
 weather_template_id = os.environ.get("TEMPLATE_ID")
 
+# 气象厅(JMA)预报接口是按都道府県分区的，这里维护 城市 -> 所属地域/代表观测点 的映射
+# 城市所属地域(region_name)决定天气/风向，代表观测点(temp_station)决定气温
+CITY_AREA_MAP = {
+    "市川市": {"area_code": "120000", "region_name": "北西部", "temp_station": "千葉"},
+}
+
+
 def get_weather(my_city):
-    urls = ["http://www.weather.com.cn/textFC/hb.shtml",
-            "http://www.weather.com.cn/textFC/db.shtml",
-            "http://www.weather.com.cn/textFC/hd.shtml",
-            "http://www.weather.com.cn/textFC/hz.shtml",
-            "http://www.weather.com.cn/textFC/hn.shtml",
-            "http://www.weather.com.cn/textFC/xb.shtml",
-            "http://www.weather.com.cn/textFC/xn.shtml"
-            ]
-    for url in urls:
-        resp = requests.get(url)
-        text = resp.content.decode("utf-8")
-        soup = BeautifulSoup(text, 'html5lib')
-        div_conMidtab = soup.find("div", class_="conMidtab")
-        tables = div_conMidtab.find_all("table")
-        for table in tables:
-            trs = table.find_all("tr")[2:]
-            for index, tr in enumerate(trs):
-                tds = tr.find_all("td")
-                # 这里倒着数，因为每个省会的td结构跟其他不一样
-                city_td = tds[-8]
-                this_city = list(city_td.stripped_strings)[0]
-                if this_city == my_city:
+    city_info = CITY_AREA_MAP.get(my_city)
+    if city_info is None:
+        raise ValueError(f"暂不支持的城市: {my_city}，请先在 CITY_AREA_MAP 中添加对应的JMA地域信息")
 
-                    high_temp_td = tds[-5]
-                    low_temp_td = tds[-2]
-                    weather_type_day_td = tds[-7]
-                    weather_type_night_td = tds[-4]
-                    wind_td_day = tds[-6]
-                    wind_td_day_night = tds[-3]
+    url = f"https://www.jma.go.jp/bosai/forecast/data/forecast/{city_info['area_code']}.json"
+    forecast = requests.get(url).json()[0]
 
-                    high_temp = list(high_temp_td.stripped_strings)[0]
-                    low_temp = list(low_temp_td.stripped_strings)[0]
-                    weather_typ_day = list(weather_type_day_td.stripped_strings)[0]
-                    weather_type_night = list(weather_type_night_td.stripped_strings)[0]
+    region_series = forecast["timeSeries"][0]
+    region = next(a for a in region_series["areas"] if a["area"]["name"] == city_info["region_name"])
+    weather_typ = region["weathers"][0].replace("　", "")
+    wind = region["winds"][0].replace("　", "")
 
-                    wind_day = list(wind_td_day.stripped_strings)[0] + list(wind_td_day.stripped_strings)[1]
-                    wind_night = list(wind_td_day_night.stripped_strings)[0] + list(wind_td_day_night.stripped_strings)[1]
+    temp_series = forecast["timeSeries"][2]
+    station = next(a for a in temp_series["areas"] if a["area"]["name"] == city_info["temp_station"])
+    temps = sorted(int(t) for t in station["temps"] if t)
+    if not temps:
+        temp = "气温数据暂缺"
+    elif len(temps) >= 2:
+        temp = f"{temps[0]}——{temps[-1]}摄氏度"
+    else:
+        temp = f"{temps[0]}摄氏度"
 
-                    # 如果没有白天的数据就使用夜间的
-                    temp = f"{low_temp}——{high_temp}摄氏度" if high_temp != "-" else f"{low_temp}摄氏度"
-                    weather_typ = weather_typ_day if weather_typ_day != "-" else weather_type_night
-                    wind = f"{wind_day}" if wind_day != "--" else f"{wind_night}"
-                    return this_city, temp, weather_typ, wind
+    return my_city, temp, weather_typ, wind
 
 
 def get_access_token():
@@ -130,4 +116,4 @@ def weather_report(this_city):
 
 
 if __name__ == '__main__':
-    weather_report("淄博")
+    weather_report("市川市")
