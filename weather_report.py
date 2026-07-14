@@ -12,36 +12,99 @@ openId = os.environ.get("OPEN_ID")
 weather_template_id = os.environ.get("TEMPLATE_ID")
 
 # 气象厅(JMA)预报接口是按都道府県分区的，这里维护 城市 -> 所属地域/代表观测点 的映射
-# 城市所属地域(region_name)决定天气/风向，代表观测点(temp_station)决定气温
+# 城市所属地域(region_name)决定天气/风向，代表观测点(temp_station)决定气温，lat/lon用于查询紫外线指数
+# region_name/temp_station 必须是JMA接口返回的原始日语地名，用于匹配；display_name是推送消息里展示的英文名
 CITY_AREA_MAP = {
-    "市川市": {"area_code": "120000", "region_name": "北西部", "temp_station": "千葉"},
+    "市川市": {"area_code": "120000", "region_name": "北西部", "temp_station": "千葉", "lat": 35.7217, "lon": 139.9310, "display_name": "Ichikawa"},
 }
+
+# JMA天气/风向原文是日语，按长词优先的顺序转换成英语单词
+WEATHER_TERM_TRANSLATIONS = {
+    "晴れ": "Sunny",
+    "くもり": "Cloudy",
+    "曇り": "Cloudy",
+    "曇": "Cloudy",
+    "晴": "Sunny",
+    "雨": "Rain",
+    "雪": "Snow",
+    "時々": " Occasionally ",
+    "一時": " Temporarily ",
+    "のち": " Then ",
+    "後": " Then ",
+    "夜のはじめ頃": " Early Evening ",
+    "夜遅く": " Late Night ",
+    "未明": " Before Dawn ",
+    "昼過ぎ": " Afternoon ",
+    "昼前": " Before Noon ",
+    "夕方": " Evening ",
+    "朝": " Morning ",
+    "夜": " At Night ",
+}
+WIND_TERM_TRANSLATIONS = {
+    "北東": "Northeast",
+    "北西": "Northwest",
+    "南東": "Southeast",
+    "南西": "Southwest",
+    "北": "North",
+    "南": "South",
+    "東": "East",
+    "西": "West",
+    "やや強く": " Somewhat Strong",
+    "強く": " Strong",
+    "弱く": " Weak",
+    "風": " Wind",
+    "の": " ",
+}
+
+
+def _translate(text, term_map):
+    for jp, en in term_map.items():
+        text = text.replace(jp, en)
+    return " ".join(text.split())
 
 
 def get_weather(my_city):
     city_info = CITY_AREA_MAP.get(my_city)
     if city_info is None:
-        raise ValueError(f"暂不支持的城市: {my_city}，请先在 CITY_AREA_MAP 中添加对应的JMA地域信息")
+        raise ValueError(f"Unsupported city: {my_city}, please add a JMA region mapping in CITY_AREA_MAP first")
 
     url = f"https://www.jma.go.jp/bosai/forecast/data/forecast/{city_info['area_code']}.json"
     forecast = requests.get(url).json()[0]
 
     region_series = forecast["timeSeries"][0]
     region = next(a for a in region_series["areas"] if a["area"]["name"] == city_info["region_name"])
-    weather_typ = region["weathers"][0].replace("　", "")
-    wind = region["winds"][0].replace("　", "")
+    weather_typ = _translate(region["weathers"][0].replace("　", ""), WEATHER_TERM_TRANSLATIONS)
+    wind = _translate(region["winds"][0].replace("　", ""), WIND_TERM_TRANSLATIONS)
 
     temp_series = forecast["timeSeries"][2]
     station = next(a for a in temp_series["areas"] if a["area"]["name"] == city_info["temp_station"])
     temps = sorted(int(t) for t in station["temps"] if t)
     if not temps:
-        temp = "气温数据暂缺"
+        temp = "Temperature data unavailable"
     elif len(temps) >= 2:
-        temp = f"{temps[0]}——{temps[-1]}摄氏度"
+        temp = f"{temps[0]}-{temps[-1]}C"
     else:
-        temp = f"{temps[0]}摄氏度"
+        temp = f"{temps[0]}C"
 
-    return my_city, temp, weather_typ, wind
+    return city_info["display_name"], temp, weather_typ, wind
+
+
+def get_uv_index(my_city):
+    city_info = CITY_AREA_MAP.get(my_city)
+    if city_info is None:
+        raise ValueError(f"Unsupported city: {my_city}, please add lat/lon to CITY_AREA_MAP first")
+
+    url = (f"https://api.open-meteo.com/v1/forecast?latitude={city_info['lat']}&longitude={city_info['lon']}"
+           "&hourly=uv_index&timezone=Asia%2FTokyo&forecast_days=1")
+    hourly = requests.get(url).json()["hourly"]
+
+    # 只展示白天时段(6:00-18:00)的逐时紫外线指数，夜间恒为0没有展示意义
+    parts = []
+    for time_str, uv in zip(hourly["time"], hourly["uv_index"]):
+        hour = int(time_str.split("T")[1].split(":")[0])
+        if 6 <= hour <= 18:
+            parts.append(f"{hour:02d}:00 UV{round(uv)}")
+    return " ".join(parts)
 
 
 def get_access_token():
@@ -54,17 +117,15 @@ def get_access_token():
     return access_token
 
 
-def get_daily_love():
-    # 每日一句情话
-    url = "https://api.lovelive.tools/api/SweetNothings/Serialization/Json"
+def get_daily_quote():
+    # 每日一句英文名言
+    url = "https://zenquotes.io/api/random"
     r = requests.get(url)
-    all_dict = json.loads(r.text)
-    sentence = all_dict['returnObj'][0]
-    daily_love = sentence
-    return daily_love
+    quote = json.loads(r.text)[0]
+    return f"{quote['q']} — {quote['a']}"
 
 
-def send_weather(access_token, weather):
+def send_weather(access_token, weather, uv_index):
     # touser 就是 openID
     # template_id 就是模板ID
     # url 就是点击模板跳转的url
@@ -72,7 +133,7 @@ def send_weather(access_token, weather):
 
     import datetime
     today = datetime.date.today()
-    today_str = today.strftime("%Y年%m月%d日")
+    today_str = today.strftime("%Y-%m-%d")
 
     body = {
         "touser": openId.strip(),
@@ -94,8 +155,11 @@ def send_weather(access_token, weather):
             "wind_dir": {
                 "value": weather[3]
             },
+            "uv_index": {
+                "value": uv_index
+            },
             "today_note": {
-                "value": get_daily_love()
+                "value": get_daily_quote()
             }
         }
     }
@@ -109,9 +173,10 @@ def weather_report(this_city):
     access_token = get_access_token()
     # 2. 获取天气
     weather = get_weather(this_city)
-    print(f"天气信息： {weather}")
+    uv_index = get_uv_index(this_city)
+    print(f"Weather info: {weather}, UV index: {uv_index}")
     # 3. 发送消息
-    send_weather(access_token, weather)
+    send_weather(access_token, weather, uv_index)
 
 
 
